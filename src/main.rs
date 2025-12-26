@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{self, Stdio};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -35,13 +35,22 @@ fn expand_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).into_owned())
 }
 
+fn log(message: &str) {
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open("/tmp/walker-yt.log") {
+        let timestamp = chrono::Local::now().format("%H:%M:%S");
+        let _ = writeln!(f, "[{}] {}", timestamp, message);
+    }
+}
+
 fn notify(title: &str, body: &str, urgency: &str) {
+    log(&format!("NOTIFY: {} - {}", title, body));
     let _ = process::Command::new("notify-send")
         .args(["-u", urgency, title, body, "-h", "string:x-canonical-private-synchronous:walker-yt"])
         .spawn();
 }
 
 async fn walker_dmenu(prompt: &str, lines: Vec<String>) -> Result<String> {
+    log(&format!("WALKER: {} ({} lines)", prompt, lines.len()));
     let mut child = Command::new("walker")
         .args(["-d", "-p", prompt])
         .stdin(Stdio::piped())
@@ -131,32 +140,6 @@ async fn get_video_qualities(video_id: &str) -> Result<Vec<String>> {
     Ok(options)
 }
 
-async fn cleanup_old_cache() -> Result<()> {
-    let cache_dir = expand_path(CACHE_DIR);
-    if !cache_dir.exists() { return Ok(()); }
-
-    let mut entries: Vec<_> = fs::read_dir(&cache_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
-        .collect();
-
-    // Sort by modified time (newest first)
-    entries.sort_by(|a, b| {
-        let ma = a.metadata().and_then(|m| m.modified()).ok();
-        let mb = b.metadata().and_then(|m| m.modified()).ok();
-        mb.cmp(&ma)
-    });
-
-    // Keep only top 5
-    if entries.len() > 5 {
-        for entry in entries.iter().skip(5) {
-            let _ = fs::remove_dir_all(entry.path());
-        }
-    }
-
-    Ok(())
-}
-
 async fn get_subtitles(video_id: &str) -> Result<Vec<String>> {
     let yt_dlp = expand_path(YT_DLP_BIN);
     let output = Command::new(yt_dlp)
@@ -173,17 +156,13 @@ async fn get_subtitles(video_id: &str) -> Result<Vec<String>> {
     let mut start_parsing = false;
 
     for line in stdout.lines() {
-        // Start parsing if we see the table header
         if line.contains("Language") && line.contains("Name") && line.contains("Formats") {
             start_parsing = true;
             continue;
         }
-        
-        // Stop parsing if we hit a different section or empty line
         if start_parsing && line.is_empty() {
             start_parsing = false;
         }
-
         if start_parsing {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
@@ -223,6 +202,34 @@ async fn select_subtitles(video_id: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+async fn cleanup_old_cache() -> Result<()> {
+    let cache_dir = expand_path(CACHE_DIR);
+    if !cache_dir.exists() { return Ok(()); }
+
+    let mut entries: Vec<_> = fs::read_dir(&cache_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+        .collect();
+
+    entries.sort_by(|a, b| {
+        let ma = a.metadata().and_then(|m| m.modified()).ok();
+        let mb = b.metadata().and_then(|m| m.modified()).ok();
+        mb.cmp(&ma)
+    });
+
+    if entries.len() > 5 {
+        for entry in entries.iter().skip(5) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn extract_video_id(url: &str) -> Option<String> {
+    let re = Regex::new(r"(?:v=|\/|youtu\.be\/|embed\/)([a-zA-Z0-9_-]{11})").ok()?;
+    re.captures(url).and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+}
+
 async fn process_audio(video_id: &str, mode: &str) -> Result<PathBuf> {
     let cache_dir = expand_path(CACHE_DIR);
     let work_dir = cache_dir.join(format!("proc_{}", video_id));
@@ -240,17 +247,18 @@ async fn process_audio(video_id: &str, mode: &str) -> Result<PathBuf> {
     notify("Live AI Stream", "Step 1/3: Downloading & Splitting...", "critical");
 
     if !audio_path.exists() {
-        Command::new(expand_path(YT_DLP_BIN))
-            .args(["-f", "bestaudio[ext=m4a]/bestaudio", "-o", audio_path.to_str().unwrap(), "--no-playlist", video_id])
+        let status = Command::new(expand_path(YT_DLP_BIN))
+            .args(["-f", "bestaudio[ext=m4a]/bestaudio", "-o", audio_path.to_str().unwrap(), "--no-playlist", "--", video_id])
             .status()
             .await?;
+        if !status.success() { return Err(anyhow!("Download failed")); }
     }
 
-    // Split into chunks
-    Command::new("ffmpeg")
+    let split_status = Command::new("ffmpeg")
         .args(["-y", "-i", audio_path.to_str().unwrap(), "-f", "segment", "-segment_time", "30", "-c", "copy", chunks_dir.join("chunk_%03d.m4a").to_str().unwrap()])
         .status()
         .await?;
+    if !split_status.success() { return Err(anyhow!("FFmpeg split failed")); }
 
     let mut entries: Vec<_> = fs::read_dir(&chunks_dir)?
         .filter_map(|e| e.ok())
@@ -266,12 +274,12 @@ async fn process_audio(video_id: &str, mode: &str) -> Result<PathBuf> {
     let out_chunks_dir_clone = out_chunks_dir.clone();
 
     tokio::spawn(async move {
+        log("WORKER: Started");
         for (i, chunk_path) in entries.iter().enumerate() {
             let chunk_name = chunk_path.file_stem().unwrap().to_str().unwrap();
             let stem_name = if mode == "vocals" { "vocals.wav" } else { "no_vocals.wav" };
             let separated_wav = out_chunks_dir_clone.join("htdemucs").join(chunk_name).join(stem_name);
 
-            // SMART SKIP: Only run Demucs if the output doesn't exist
             if !separated_wav.exists() {
                 let _ = Command::new("systemd-run")
                     .args([
@@ -298,20 +306,18 @@ async fn process_audio(video_id: &str, mode: &str) -> Result<PathBuf> {
                     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&playback_file_clone) {
                         let _ = f.write_all(&output.stdout);
                         let _ = f.sync_all();
+                        log(&format!("WORKER: Chunk {} appended. Total size: {}", i+1, fs::metadata(&playback_file_clone).map(|m| m.len()).unwrap_or(0)));
                     }
                 }
             }
             notify("Live AI Stream", &format!("Separating: Chunk {}/{}", i + 1, total), "low");
         }
+        log("WORKER: Finished");
     });
 
-    // Wait for buffer: 2 chunks or 10MB
     let start_time = std::time::Instant::now();
     loop {
-        if playback_file.exists() && fs::metadata(&playback_file)?.len() >= 10_000_000 {
-            break;
-        }
-        // Fallback if video is short
+        if playback_file.exists() && fs::metadata(&playback_file)?.len() >= 10_000_000 { break; }
         if start_time.elapsed() > Duration::from_secs(240) {
             if playback_file.exists() && fs::metadata(&playback_file)?.len() > 0 { break; }
             return Err(anyhow!("Timeout waiting for audio buffer"));
@@ -324,161 +330,107 @@ async fn process_audio(video_id: &str, mode: &str) -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // One-time old cache cleanup check
     let _ = cleanup_old_cache().await;
-
     let args = Args::parse();
     
-    let query = if !args.query.is_empty() {
-        args.query.join(" ")
-    } else {
-        walker_dmenu("Search YouTube", vec![]).await?
-    };
+    let query = if !args.query.is_empty() { args.query.join(" ") } 
+                    else { walker_dmenu("Search YouTube", vec![]).await? };
 
     if query.is_empty() { return Ok(()); }
 
-    notify("Searching", &format!("Searching for: {}", query), "normal");
-    let videos = search_youtube(&query).await?;
-    if videos.is_empty() {
-        notify("Walker YT", "No results found.", "normal");
-        return Ok(());
+    let mut video_id = extract_video_id(&query);
+    let mut video_title = query.clone();
+
+    if video_id.is_none() {
+        notify("Searching", &format!("Searching for: {}", query), "normal");
+        let videos = search_youtube(&query).await?;
+        if videos.is_empty() {
+            notify("Walker YT", "No results found.", "normal");
+            return Ok(());
+        }
+        let display_lines: Vec<String> = videos.iter().map(|v| format!("{} ({})", v.title, v.channel)).collect();
+        let selected_str = walker_dmenu("Select Video", display_lines.clone()).await?;
+        if selected_str.is_empty() { return Ok(()); }
+        let idx = display_lines.iter().position(|s| s == &selected_str).unwrap();
+        video_id = Some(videos[idx].id.clone());
+        video_title = videos[idx].title.clone();
     }
 
-    let display_lines: Vec<String> = videos.iter().map(|v| format!("{} ({})", v.title, v.channel)).collect();
-    let selected_str = walker_dmenu("Select Video", display_lines.clone()).await?;
-    if selected_str.is_empty() { return Ok(()); }
-
-    let selected_index = display_lines.iter().position(|s| s == &selected_str).ok_or_else(|| anyhow!("Selection mismatch"))?;
-    let selected_video = &videos[selected_index];
-
-    let actions = vec![
-        "🎬 Watch Video (Auto)".to_string(),
-        "⚙️ Watch Video (Select Quality & Subs)".to_string(),
-        "🎧 Listen Audio (MPV --no-video)".to_string(),
-        "🎤 Keep Vocals (Select Quality & Subs)".to_string(),
-        "🎵 Keep Music (Select Quality & Subs)".to_string(),
-    ];
-    let action_str = walker_dmenu(&format!("Action: {}", selected_video.title), actions).await?;
+    let vid = video_id.ok_or_else(|| anyhow!("Failed to get video ID"))?;
+    let actions = vec!["🎬 Watch Video (Auto)".to_string(), "⚙️ Watch Video (Select Quality & Subs)".to_string(), "🎧 Listen Audio (MPV --no-video)".to_string(), "🎤 Keep Vocals (Select Quality & Subs)".to_string(), "🎵 Keep Music (Select Quality & Subs)".to_string()];
+    let action_str = walker_dmenu(&format!("Action: {}", video_title), actions).await?;
     if action_str.is_empty() { return Ok(()); }
 
-    let url = format!("https://www.youtube.com/watch?v={}", selected_video.id);
-    let mpv_cmd = vec![
-        "mpv".to_string(),
-        "--title=walker-yt".to_string(),
-        format!("--script-opts=ytdl_hook-ytdl_path={}", expand_path(YT_DLP_BIN).to_str().unwrap()),
-        "--force-window".to_string(),
-        "--cache=yes".to_string(),
-        "--cache-pause-wait=5".to_string(),
-        "--demuxer-readahead-secs=20".to_string(),
-    ];
+    let url = format!("https://www.youtube.com/watch?v={}", vid);
+    let mpv_cmd = vec!["mpv".to_string(), "--title=walker-yt".to_string(), format!("--script-opts=ytdl_hook-ytdl_path={}", expand_path(YT_DLP_BIN).to_str().unwrap()), "--force-window".to_string(), "--cache=yes".to_string(), "--cache-pause-wait=5".to_string(), "--demuxer-readahead-secs=20".to_string()];
 
     let mut video_format = "bestvideo+bestaudio/best".to_string();
     let mut subtitle_code: Option<String> = None;
 
     if action_str.contains("Select Quality") {
-        let qualities = get_video_qualities(&selected_video.id).await?;
+        let qualities = get_video_qualities(&vid).await?;
         let quality_selection = walker_dmenu("Select Video Quality", qualities).await?;
         if !quality_selection.is_empty() {
             let re = Regex::new(r"(\d+)p(\d+)?").unwrap();
             if let Some(caps) = re.captures(&quality_selection) {
                 let h = &caps[1];
-                let fps = caps.get(2).map(|m| m.as_str());
-                video_format = if let Some(f) = fps {
-                    format!("bestvideo[height<={}][fps<={}]", h, f)
-                } else {
-                    format!("bestvideo[height<={}]", h)
-                };
-                if action_str.contains("Watch Video") {
-                    video_format.push_str("+bestaudio/best");
-                }
+                video_format = if let Some(f) = caps.get(2) { format!("bestvideo[height<={}][fps<={}]", h, f.as_str()) } else { format!("bestvideo[height<={}]", h) };
+                if action_str.contains("Watch Video") { video_format.push_str("+bestaudio/best"); }
             }
         }
-        
-        // Fetch and select subtitles
-        subtitle_code = select_subtitles(&selected_video.id).await?;
+        subtitle_code = select_subtitles(&vid).await?;
     }
 
     if action_str.contains("Watch Video") {
-        notify("Playing", &selected_video.title, "normal");
+        notify("Playing", &video_title, "normal");
         let mut final_args = mpv_cmd;
         final_args.extend([url, format!("--ytdl-format={}", video_format)]);
-        
         if let Some(code) = subtitle_code {
-            final_args.extend([
-                format!("--ytdl-raw-options=write-subs=,write-auto-sub=,sub-langs=\"{}.*\"", code),
-                "--sub-visibility=yes".to_string(),
-                "--sub-auto=all".to_string(),
-                "--sid=1".to_string(),
-            ]);
+            final_args.extend([format!("--ytdl-raw-options=write-subs=,write-auto-sub=,sub-langs=\"{}.*\"", code), "--sub-visibility=yes".to_string(), "--sub-auto=all".to_string(), "--sid=1".to_string()]);
         }
-        
         Command::new("mpv").args(&final_args[1..]).spawn()?;
     } else if action_str.contains("Listen Audio") {
-        notify("Playing Audio", &selected_video.title, "normal");
+        notify("Playing Audio", &video_title, "normal");
         Command::new("mpv").args(["--no-video", &url]).spawn()?;
     } else if action_str.contains("Keep Vocals") || action_str.contains("Keep Music") {
         let mode = if action_str.contains("Keep Vocals") { "vocals" } else { "music" };
+        let _my_pid = std::process::id();
         
-        // Cleanup previous sessions
         let _ = Command::new("pkill").args(["-f", "demucs"]).status().await;
         let _ = Command::new("pkill").args(["-f", "mpv.*--title=walker-yt"]).status().await;
 
-        let audio_pcm = process_audio(&selected_video.id, mode).await?;
-        
+        let audio_pcm = process_audio(&vid, mode).await?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         
         let audio_pcm_clone = audio_pcm.clone();
         tokio::spawn(async move {
+            log("TCP: Server started");
             if let Ok((mut stream, _)) = listener.accept().await {
+                log("TCP: Player connected");
                 if let Ok(mut f) = fs::File::open(&audio_pcm_clone) {
                     let mut buffer = [0; 16384];
                     loop {
                         let n = f.read(&mut buffer).unwrap_or(0);
-                        if n > 0 {
-                            if stream.write_all(&buffer[..n]).await.is_err() { break; }
-                        } else {
-                            sleep(Duration::from_millis(500)).await;
-                        }
+                        if n > 0 { if stream.write_all(&buffer[..n]).await.is_err() { break; } }
+                        else { sleep(Duration::from_millis(500)).await; }
                     }
                 }
             }
+            log("TCP: Server closed");
         });
 
-        let live_args = vec![
-            format!("--audio-file=tcp://127.0.0.1:{}", port),
-            "--audio-demuxer=rawaudio".to_string(),
-            "--demuxer-rawaudio-rate=44100".to_string(),
-            "--demuxer-rawaudio-channels=2".to_string(),
-            "--demuxer-rawaudio-format=s16le".to_string(),
-            "--cache=yes".to_string(),
-            "--cache-secs=3600".to_string(),
-            "--aid=1".to_string(),
-        ];
-        
-        if !action_str.contains("Select Quality") {
-            video_format = "bestvideo".to_string();
-        } else if !video_format.contains("bestvideo") {
-            video_format = "bestvideo".to_string();
-        }
-
         let mut final_args = mpv_cmd;
-        final_args.extend([url, format!("--ytdl-format={}", video_format)]);
-        final_args.extend(live_args);
+        final_args.extend([url, format!("--ytdl-format={}", if action_str.contains("Select Quality") { video_format } else { "bestvideo".to_string() })]);
+        final_args.extend([format!("--audio-file=tcp://127.0.0.1:{}", port), "--audio-demuxer=rawaudio".to_string(), "--demuxer-rawaudio-rate=44100".to_string(), "--demuxer-rawaudio-channels=2".to_string(), "--demuxer-rawaudio-format=s16le".to_string(), "--cache=yes".to_string(), "--cache-secs=3600".to_string(), "--aid=1".to_string()]);
         
         if let Some(code) = subtitle_code {
-            final_args.extend([
-                format!("--ytdl-raw-options=write-subs=,write-auto-sub=,sub-langs=\"{}.*\"", code),
-                "--sub-visibility=yes".to_string(),
-                "--sub-auto=all".to_string(),
-                "--sid=1".to_string(),
-            ]);
+            final_args.extend([format!("--ytdl-raw-options=write-subs=,write-auto-sub=,sub-langs=\"{}.*\"", code), "--sub-visibility=yes".to_string(), "--sub-auto=all".to_string(), "--sid=1".to_string()]);
         }
         
         let mut child = Command::new("mpv").args(&final_args[1..]).spawn()?;
-        child.wait().await?;
+        let _ = child.wait().await;
         let _ = Command::new("pkill").args(["-f", "demucs"]).status().await;
     }
-
     Ok(())
 }
